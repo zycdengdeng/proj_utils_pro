@@ -72,7 +72,22 @@ def quaternion_to_rotation_matrix(q):
 
 
 def get_3d_bbox_corners(center, size, yaw):
-    """计算3D bbox的8个角点（世界坐标系）"""
+    """
+    计算3D bbox的8个角点（世界坐标系）
+
+    角点顺序（从上往下看，逆时针）：
+        4 -------- 5
+       /|        /|
+      / |       / |
+     7 -------- 6 |
+     |  0 ------|- 1
+     | /        | /
+     |/         |/
+     3 -------- 2
+
+    底面(z-): 0, 1, 2, 3
+    顶面(z+): 4, 5, 6, 7
+    """
     x, y, z = center
     l, w, h = size
 
@@ -96,6 +111,40 @@ def get_3d_bbox_corners(center, size, yaw):
     # 旋转 + 平移
     corners_rotated = (R @ corners.T).T + center
     return corners_rotated
+
+
+# 3D bbox的12条边定义
+BBOX_3D_EDGES = [
+    # 底面4条边
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    # 顶面4条边
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    # 垂直4条边（连接底面和顶面）
+    (0, 4), (1, 5), (2, 6), (3, 7)
+]
+
+
+def draw_3d_bbox(img, corners_2d, corners_valid, color, thickness=2):
+    """
+    绘制3D bbox的12条边
+
+    Args:
+        img: 图像
+        corners_2d: 8个角点的2D坐标 [(x, y), ...]
+        corners_valid: 8个角点的有效性标记 [True/False, ...]
+        color: 颜色 (B, G, R)
+        thickness: 线宽
+    """
+    if corners_2d is None or len(corners_2d) != 8:
+        return
+
+    # 绘制12条边
+    for i, j in BBOX_3D_EDGES:
+        # 只有两个端点都有效时才绘制这条边
+        if corners_valid[i] and corners_valid[j]:
+            pt1 = (int(corners_2d[i][0]), int(corners_2d[i][1]))
+            pt2 = (int(corners_2d[j][0]), int(corners_2d[j][1]))
+            cv2.line(img, pt1, pt2, color, thickness)
 
 
 def find_gt_image(gt_images_folder, camera_name, timestamp_ms):
@@ -245,7 +294,8 @@ class HDMapProjectorMultiThread:
 
         Returns:
             bbox_2d: [x1, y1, x2, y2] or None
-            corners_2d: 投影后的角点坐标列表
+            corners_2d: 所有8个角点的2D坐标列表 [(x, y), ...] (无效点为None)
+            corners_valid: 8个角点的有效性标记列表 [True/False, ...]
         """
         cam_info = VEHICLE_CAMERAS[cam_id]
         img_w, img_h = cam_info["resolution"]
@@ -270,12 +320,10 @@ class HDMapProjectorMultiThread:
 
         points_cam = (R_lidar2cam @ points_lidar.T).T + t_lidar2cam
 
-        # 过滤相机前方的点
+        # 标记相机前方的点（z > 0.1）
         valid_mask = points_cam[:, 2] > 0.1
         if not valid_mask.any():
-            return None, None
-
-        points_valid = points_cam[valid_mask]
+            return None, None, None
 
         # 步骤3: 相机坐标系 → 图像坐标系（去畸变投影）
         if cam_id in [2, 3, 4] and np.max(np.abs(D)) > 1:
@@ -285,18 +333,43 @@ class HDMapProjectorMultiThread:
         else:
             new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (img_w, img_h), 0, (img_w, img_h))
 
-        # 线性投影
-        uv_homogeneous = (new_K @ points_valid.T).T
-        z_proj = uv_homogeneous[:, 2]
-        uv = uv_homogeneous[:, :2] / z_proj[:, np.newaxis]
+        # 对所有8个角点进行投影，保持顺序
+        corners_2d = []
+        corners_valid = []
 
-        # 计算2D bbox
-        x1, y1 = uv.min(axis=0)
-        x2, y2 = uv.max(axis=0)
+        for i in range(8):
+            if valid_mask[i]:
+                # 点在相机前方，可以投影
+                pt_cam = points_cam[i]
+                uv_homogeneous = new_K @ pt_cam
+                z = uv_homogeneous[2]
+                uv = uv_homogeneous[:2] / z
+
+                # 检查是否在图像范围内（带一定容差）
+                margin = 500  # 允许点稍微超出图像边界，这样边缘的物体也能显示
+                if -margin <= uv[0] <= img_w + margin and -margin <= uv[1] <= img_h + margin:
+                    corners_2d.append([float(uv[0]), float(uv[1])])
+                    corners_valid.append(True)
+                else:
+                    corners_2d.append([float(uv[0]), float(uv[1])])
+                    corners_valid.append(False)
+            else:
+                # 点在相机后方，标记为无效
+                corners_2d.append([0.0, 0.0])
+                corners_valid.append(False)
+
+        # 计算有效点的2D bbox
+        valid_points = [corners_2d[i] for i in range(8) if corners_valid[i]]
+        if not valid_points:
+            return None, None, None
+
+        valid_points = np.array(valid_points)
+        x1, y1 = valid_points.min(axis=0)
+        x2, y2 = valid_points.max(axis=0)
 
         # 检查是否在图像内
         if x2 < 0 or y2 < 0 or x1 > img_w or y1 > img_h:
-            return None, None
+            return None, None, None
 
         # 裁剪到图像范围
         x1 = max(0, x1)
@@ -305,9 +378,8 @@ class HDMapProjectorMultiThread:
         y2 = min(img_h, y2)
 
         bbox_2d = [float(x1), float(y1), float(x2), float(y2)]
-        corners_2d = uv.tolist()
 
-        return bbox_2d, corners_2d
+        return bbox_2d, corners_2d, corners_valid
 
     def process_single_camera(self, cam_id, objects_data, rotate_world2lidar,
                              trans_world2lidar, timestamp_ms, gt_dir,
@@ -331,7 +403,7 @@ class HDMapProjectorMultiThread:
         # 投影所有物体的bbox
         for obj_data in objects_data:
             bbox_corners = obj_data['bbox_corners']
-            bbox_2d, corners_2d = self.project_bbox_to_camera(
+            bbox_2d, corners_2d, corners_valid = self.project_bbox_to_camera(
                 bbox_corners, rotate_world2lidar, trans_world2lidar, cam_id
             )
 
@@ -342,21 +414,23 @@ class HDMapProjectorMultiThread:
                     'color': obj_data['color'],
                     'bbox_2d': bbox_2d,
                     'corners_2d': corners_2d,
+                    'corners_valid': corners_valid,
                     'bbox_3d': obj_data['bbox_3d']
                 })
 
-        # 生成纯bbox图（黑色背景 + 彩色bbox框）
+        # 生成纯bbox图（黑色背景 + 彩色3D bbox框）
         # 总是生成overlay：有bbox就绘制，没bbox就是纯黑色
         cam_info = VEHICLE_CAMERAS[cam_id]
         img_w, img_h = cam_info["resolution"]
         bbox_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)  # 黑色背景
 
         if results['bboxes']:
-            # 如果有bbox，绘制在黑色背景上
+            # 如果有bbox，绘制3D bbox在黑色背景上
             for bbox_info in results['bboxes']:
-                x1, y1, x2, y2 = [int(v) for v in bbox_info['bbox_2d']]
                 color = tuple(int(c) for c in bbox_info['color'])
-                cv2.rectangle(bbox_img, (x1, y1), (x2, y2), color, 2)
+                # 使用新的3D bbox绘制函数
+                draw_3d_bbox(bbox_img, bbox_info['corners_2d'],
+                            bbox_info['corners_valid'], color, thickness=2)
 
         # 总是保存overlay（有bbox就是黑色+bbox，没bbox就是纯黑色）
         overlay_output = overlay_dir / f"{cam_name}.jpg"
@@ -368,11 +442,12 @@ class HDMapProjectorMultiThread:
             bbox_on_gt_img = results['gt_img'].copy()
 
             if results['bboxes']:
-                # 如果有bbox，绘制在GT图像上
+                # 如果有bbox，绘制3D bbox在GT图像上
                 for bbox_info in results['bboxes']:
-                    x1, y1, x2, y2 = [int(v) for v in bbox_info['bbox_2d']]
                     color = tuple(int(c) for c in bbox_info['color'])
-                    cv2.rectangle(bbox_on_gt_img, (x1, y1), (x2, y2), color, 2)
+                    # 使用新的3D bbox绘制函数
+                    draw_3d_bbox(bbox_on_gt_img, bbox_info['corners_2d'],
+                                bbox_info['corners_valid'], color, thickness=2)
 
             # 总是保存bbox_on_gt（有bbox就是GT+bbox，没bbox就是纯GT）
             bbox_on_gt_output = bbox_on_gt_dir / f"{cam_name}.jpg"
