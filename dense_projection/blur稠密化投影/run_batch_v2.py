@@ -41,7 +41,7 @@ def run_single_projection(args):
 
         transforms = run_single_projection.transforms_cache[transform_json]
 
-        projector = projector_module.BlurProjectorMultiThread(
+        projector = projector_module.BlurDenseProjectorMultiThread(
             roadside_calib, roadside_images, vehicle_calib, gt_images_folder, transforms
         )
 
