@@ -426,23 +426,17 @@ class BlurDenseProjectorMultiThread:
         return img_dense, len(uv_valid)
 
     def densify_rgb_image(self, rgb_image, depth_buffer, max_hole_size=100):
-        """RGB图像4级稠密化和空洞填补"""
+        """RGB图像稠密化和空洞填补（保守版，避免物体膨胀）"""
 
         # 创建有效像素掩码
         valid_mask = (rgb_image.sum(axis=2) > 0).astype(np.uint8)
 
         filled_rgb = rgb_image.copy()
 
-        # 1. 小空洞：形态学填充
-        filled_rgb = self._morphological_fill_rgb(filled_rgb, valid_mask, kernel_size=3)
-
-        # 2. 中等空洞：引导滤波
-        filled_rgb = self._guided_fill_rgb(filled_rgb, valid_mask, kernel_size=5)
-
-        # 3. 大空洞：最近邻插值（减小距离避免失真）
+        # 只使用最近邻填充，避免膨胀
         filled_rgb = self._nearest_neighbor_fill_rgb(filled_rgb, valid_mask, max_distance=5)
 
-        # 4. 边缘保持平滑
+        # 边缘保持平滑（只对填充区域）
         filled_rgb = self._edge_preserving_smooth_rgb(filled_rgb, valid_mask)
 
         return filled_rgb

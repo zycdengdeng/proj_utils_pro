@@ -176,12 +176,9 @@ class DepthDenseProjectorMultiThread:
 
     def densify_depth_image(self, depth_raw):
         """
-        深度图稠密化处理（4级策略）- 向量化优化版本
+        深度图稠密化处理（保守版，避免物体膨胀）
 
-        级别1: 形态学填充（小空洞 < 5x5）- 使用卷积计算邻域平均
-        级别2: 邻域平均填充（中等空洞）- 使用卷积计算邻域平均
-        级别3: 最近邻插值（大空洞）- 使用距离变换一次性完成
-        级别4: 轻度平滑 - 使用双边滤波
+        只使用最近邻插值填补空洞，不使用形态学膨胀
 
         Args:
             depth_raw: 原始深度图 (float32)
@@ -195,93 +192,34 @@ class DepthDenseProjectorMultiThread:
         if np.sum(valid_mask) == 0:
             return depth_dense
 
-        h, w = depth_raw.shape
-
-        # ====== 级别1: 形态学填充（小空洞）使用向量化 ======
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        depth_binary = (depth_dense > 0).astype(np.uint8) * 255
-        depth_binary_closed = cv2.morphologyEx(depth_binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        # 对新填充的区域，用3x3邻域平均填充（向量化版本）
-        new_filled_mask = (depth_binary_closed > 0) & (depth_dense == 0)
-        if np.any(new_filled_mask):
-            # 创建一个权重矩阵，用于计算加权平均
-            # 使用卷积计算邻域和与邻域计数
-            kernel_3x3 = np.ones((3, 3), dtype=np.float32)
-
-            # 计算邻域深度和
-            depth_sum = cv2.filter2D(depth_dense, -1, kernel_3x3, borderType=cv2.BORDER_CONSTANT)
-
-            # 计算邻域有效像素数（depth > 0 的像素）
-            valid_binary = (depth_dense > 0).astype(np.float32)
-            valid_count = cv2.filter2D(valid_binary, -1, kernel_3x3, borderType=cv2.BORDER_CONSTANT)
-
-            # 计算平均值（避免除零）
-            avg_depth = np.zeros_like(depth_dense)
-            valid_avg_mask = valid_count > 0
-            avg_depth[valid_avg_mask] = depth_sum[valid_avg_mask] / valid_count[valid_avg_mask]
-
-            # 只填充需要填充的区域
-            depth_dense[new_filled_mask] = avg_depth[new_filled_mask]
-
-        # ====== 级别2: 5x5邻域平均填充（中等空洞）使用向量化 ======
-        for iteration in range(1):  # 减少迭代次数，避免过度扩散
-            depth_binary = (depth_dense > 0).astype(np.uint8) * 255
-            depth_binary_dilated = cv2.dilate(depth_binary, np.ones((5, 5), np.uint8), iterations=1)
-            new_filled_mask = (depth_binary_dilated > 0) & (depth_dense == 0)
-
-            if np.any(new_filled_mask):
-                # 使用5x5卷积核计算邻域平均（向量化版本）
-                kernel_5x5 = np.ones((5, 5), dtype=np.float32)
-
-                # 计算邻域深度和
-                depth_sum = cv2.filter2D(depth_dense, -1, kernel_5x5, borderType=cv2.BORDER_CONSTANT)
-
-                # 计算邻域有效像素数
-                valid_binary = (depth_dense > 0).astype(np.float32)
-                valid_count = cv2.filter2D(valid_binary, -1, kernel_5x5, borderType=cv2.BORDER_CONSTANT)
-
-                # 计算平均值
-                avg_depth = np.zeros_like(depth_dense)
-                valid_avg_mask = valid_count > 0
-                avg_depth[valid_avg_mask] = depth_sum[valid_avg_mask] / valid_count[valid_avg_mask]
-
-                # 只填充需要填充的区域
-                depth_dense[new_filled_mask] = avg_depth[new_filled_mask]
-
-        # ====== 级别3: 最近邻插值（大空洞，距离<10像素）使用距离变换 ======
+        # ====== 最近邻插值（距离<10像素）使用距离变换 ======
+        original_valid_mask = valid_mask.copy()  # 保存原始有效像素掩码
         invalid_mask = depth_dense == 0
+
         if np.any(invalid_mask):
-            valid_mask_level3 = depth_dense > 0
-            if np.any(valid_mask_level3):
-                # 使用距离变换一次性找到所有无效像素的最近有效像素
-                # distance_transform_edt 返回到最近有效像素的距离和索引
-                distances, indices = ndimage.distance_transform_edt(
-                    invalid_mask,
-                    return_distances=True,
-                    return_indices=True
-                )
-
-                # 只填充距离 < 10 像素的区域（减小距离避免失真）
-                fill_mask = invalid_mask & (distances < 10)
-
-                if np.any(fill_mask):
-                    # indices[0] 是行索引，indices[1] 是列索引
-                    nearest_y = indices[0][fill_mask]
-                    nearest_x = indices[1][fill_mask]
-
-                    # 从最近的有效像素复制深度值
-                    depth_dense[fill_mask] = depth_dense[nearest_y, nearest_x]
-
-        # ====== 级别4: 轻度双边滤波平滑 ======
-        valid_mask_final = depth_dense > 0
-        if np.sum(valid_mask_final) > 100:
-            # 只对有效区域进行轻度平滑
-            depth_temp = depth_dense.copy()
-            depth_smoothed = cv2.bilateralFilter(
-                depth_temp.astype(np.float32), d=5, sigmaColor=10, sigmaSpace=5
+            # 使用距离变换一次性找到所有无效像素的最近有效像素
+            distances, indices = ndimage.distance_transform_edt(
+                invalid_mask,
+                return_distances=True,
+                return_indices=True
             )
-            depth_dense[valid_mask_final] = depth_smoothed[valid_mask_final]
+
+            # 只填充距离 < 10 像素的区域
+            fill_mask = invalid_mask & (distances < 10)
+
+            if np.any(fill_mask):
+                nearest_y = indices[0][fill_mask]
+                nearest_x = indices[1][fill_mask]
+                depth_dense[fill_mask] = depth_dense[nearest_y, nearest_x]
+
+        # ====== 轻度双边滤波平滑（只对填充区域）======
+        filled_mask = (depth_dense > 0) & (~original_valid_mask)
+        if np.sum(filled_mask) > 0:
+            depth_smoothed = cv2.bilateralFilter(
+                depth_dense.astype(np.float32), d=5, sigmaColor=10, sigmaSpace=5
+            )
+            # 只对填充区域应用平滑，保持原始点不变
+            depth_dense[filled_mask] = depth_smoothed[filled_mask]
 
         # 保证无点区域仍为纯黑色
         depth_dense[depth_dense <= 0] = 0
