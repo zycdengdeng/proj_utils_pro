@@ -204,8 +204,8 @@ class DepthDenseProjectorMultiThread:
                 return_indices=True
             )
 
-            # 只填充距离 < 10 像素的区域
-            fill_mask = invalid_mask & (distances < 10)
+            # 只填充距离 < 2 像素的区域
+            fill_mask = invalid_mask & (distances < 2)
 
             if np.any(fill_mask):
                 nearest_y = indices[0][fill_mask]

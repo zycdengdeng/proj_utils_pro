@@ -434,7 +434,7 @@ class BlurDenseProjectorMultiThread:
         filled_rgb = rgb_image.copy()
 
         # 只使用最近邻填充，避免膨胀
-        filled_rgb = self._nearest_neighbor_fill_rgb(filled_rgb, valid_mask, max_distance=5)
+        filled_rgb = self._nearest_neighbor_fill_rgb(filled_rgb, valid_mask, max_distance=2)
 
         # 边缘保持平滑（只对填充区域）
         filled_rgb = self._edge_preserving_smooth_rgb(filled_rgb, valid_mask)
