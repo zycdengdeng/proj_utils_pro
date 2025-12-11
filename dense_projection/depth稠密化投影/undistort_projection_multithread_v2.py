@@ -225,7 +225,7 @@ class DepthDenseProjectorMultiThread:
             depth_dense[new_filled_mask] = avg_depth[new_filled_mask]
 
         # ====== 级别2: 5x5邻域平均填充（中等空洞）使用向量化 ======
-        for iteration in range(2):
+        for iteration in range(1):  # 减少迭代次数，避免过度扩散
             depth_binary = (depth_dense > 0).astype(np.uint8) * 255
             depth_binary_dilated = cv2.dilate(depth_binary, np.ones((5, 5), np.uint8), iterations=1)
             new_filled_mask = (depth_binary_dilated > 0) & (depth_dense == 0)
@@ -249,7 +249,7 @@ class DepthDenseProjectorMultiThread:
                 # 只填充需要填充的区域
                 depth_dense[new_filled_mask] = avg_depth[new_filled_mask]
 
-        # ====== 级别3: 最近邻插值（大空洞，距离<20像素）使用距离变换 ======
+        # ====== 级别3: 最近邻插值（大空洞，距离<10像素）使用距离变换 ======
         invalid_mask = depth_dense == 0
         if np.any(invalid_mask):
             valid_mask_level3 = depth_dense > 0
@@ -262,8 +262,8 @@ class DepthDenseProjectorMultiThread:
                     return_indices=True
                 )
 
-                # 只填充距离 < 20 像素的区域
-                fill_mask = invalid_mask & (distances < 20)
+                # 只填充距离 < 10 像素的区域（减小距离避免失真）
+                fill_mask = invalid_mask & (distances < 10)
 
                 if np.any(fill_mask):
                     # indices[0] 是行索引，indices[1] 是列索引

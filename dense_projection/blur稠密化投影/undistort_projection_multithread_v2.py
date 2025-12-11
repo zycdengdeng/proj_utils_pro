@@ -439,8 +439,8 @@ class BlurDenseProjectorMultiThread:
         # 2. 中等空洞：引导滤波
         filled_rgb = self._guided_fill_rgb(filled_rgb, valid_mask, kernel_size=5)
 
-        # 3. 大空洞：最近邻插值
-        filled_rgb = self._nearest_neighbor_fill_rgb(filled_rgb, valid_mask, max_distance=10)
+        # 3. 大空洞：最近邻插值（减小距离避免失真）
+        filled_rgb = self._nearest_neighbor_fill_rgb(filled_rgb, valid_mask, max_distance=5)
 
         # 4. 边缘保持平滑
         filled_rgb = self._edge_preserving_smooth_rgb(filled_rgb, valid_mask)
@@ -455,7 +455,7 @@ class BlurDenseProjectorMultiThread:
         for c in range(3):
             channel = filled[:, :, c]
 
-            for _ in range(2):
+            for _ in range(1):  # 减少迭代次数，避免过度扩散
                 dilated = cv2.dilate(channel, kernel, iterations=1)
                 mask = (valid_mask == 0) & (dilated > 0)
                 channel[mask] = dilated[mask]
@@ -516,7 +516,7 @@ class BlurDenseProjectorMultiThread:
         return filled
 
     def _edge_preserving_smooth_rgb(self, rgb_image, original_valid_mask):
-        """边缘保持平滑"""
+        """边缘保持平滑 - 只对填充区域平滑，保持原始点不变"""
         smooth = cv2.bilateralFilter(
             rgb_image,
             d=5,
@@ -524,16 +524,12 @@ class BlurDenseProjectorMultiThread:
             sigmaSpace=5
         )
 
-        mask = original_valid_mask > 0
-        blend_factor = 0.8
+        result = rgb_image.copy()
+        # 只对填充区域（非原始有效点）应用平滑
+        filled_mask = (original_valid_mask == 0) & (rgb_image.sum(axis=2) > 0)
+        result[filled_mask] = smooth[filled_mask]
 
-        for c in range(3):
-            smooth[:, :, c][mask] = (
-                blend_factor * rgb_image[:, :, c][mask] +
-                (1 - blend_factor) * smooth[:, :, c][mask]
-            )
-
-        return smooth
+        return result
 
     def process_single_camera(self, cam_id, points, colors, rotate_world2lidar,
                              trans_world2lidar, timestamp_ms, proj_dir, gt_dir,
