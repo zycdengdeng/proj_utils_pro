@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Dense Projection Video Maker
+Dense Projection Video Maker - 交互式视频生成
 
-从投影输出结果生成视频
-支持 depth、depth_dense、blur、blur_dense、basic 等投影类型
+从投影输出结果生成视频，支持按方向和clip选择
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
-import argparse
 from tqdm import tqdm
 import sys
+import os
+
+# 添加父目录到路径
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import DIRECTION_CLIPS, DIRECTION_CHOICES, get_clip_id
 
 # 相机名称
 CAMERA_NAMES = ['FN', 'FW', 'FL', 'FR', 'RL', 'RR', 'RN']
+
+# 投影类型配置
+PROJECT_TYPES = {
+    '1': {'name': '基本点云投影', 'dir': '基本点云投影', 'subdirs': ['proj', 'gt', 'compare', 'overlay']},
+    '2': {'name': 'depth投影', 'dir': 'depth投影', 'subdirs': ['depth', 'gt', 'compare', 'overlay']},
+    '3': {'name': 'depth稠密化投影', 'dir': 'depth稠密化投影', 'subdirs': ['depth', 'gt', 'compare', 'overlay']},
+    '4': {'name': 'blur投影', 'dir': 'blur投影', 'subdirs': ['proj', 'gt', 'compare', 'overlay']},
+    '5': {'name': 'blur稠密化投影', 'dir': 'blur稠密化投影', 'subdirs': ['proj', 'gt', 'compare', 'overlay']},
+}
 
 
 def get_sorted_timestamp_folders(scene_dir):
@@ -23,7 +35,6 @@ def get_sorted_timestamp_folders(scene_dir):
     scene_path = Path(scene_dir)
 
     if not scene_path.exists():
-        print(f"警告: 场景目录不存在: {scene_dir}")
         return []
 
     timestamp_folders = []
@@ -35,104 +46,77 @@ def get_sorted_timestamp_folders(scene_dir):
     return timestamp_folders
 
 
-def create_video_from_images(image_paths, output_path, fps, target_resolution=None):
-    """
-    从图像列表创建视频
-
-    Args:
-        image_paths: 图像路径列表
-        output_path: 输出视频路径
-        fps: 帧率
-        target_resolution: 目标分辨率 (width, height)，None则使用原始分辨率
-    """
+def create_video_from_images(image_paths, output_path, fps):
+    """从图像列表创建视频"""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not image_paths:
-        print(f"警告: 没有图像可用于创建视频")
         return False
 
-    # 读取第一张图像获取分辨率
     first_img = cv2.imread(str(image_paths[0]))
     if first_img is None:
-        print(f"警告: 无法读取第一张图像 {image_paths[0]}")
         return False
 
-    if target_resolution is None:
-        target_resolution = (first_img.shape[1], first_img.shape[0])
+    resolution = (first_img.shape[1], first_img.shape[0])
 
-    # 初始化视频写入器
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(
-        str(output_path),
-        fourcc,
-        fps,
-        target_resolution
-    )
+    video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, resolution)
 
-    # 写入帧
     for img_path in image_paths:
         img = cv2.imread(str(img_path))
-        if img is None:
-            print(f"警告: 无法读取图像 {img_path}")
-            continue
-
-        # 缩放到目标分辨率
-        if img.shape[1] != target_resolution[0] or img.shape[0] != target_resolution[1]:
-            img = cv2.resize(img, target_resolution, interpolation=cv2.INTER_LINEAR)
-
-        video_writer.write(img)
+        if img is not None:
+            if img.shape[1] != resolution[0] or img.shape[0] != resolution[1]:
+                img = cv2.resize(img, resolution, interpolation=cv2.INTER_LINEAR)
+            video_writer.write(img)
 
     video_writer.release()
     return True
 
 
-def process_clip(clip_dir, output_dir, fps, subdirs, cameras, target_resolution=None):
-    """
-    处理单个clip，生成视频
+def process_clip(clip_name, project_type_info, fps, output_root):
+    """处理单个clip生成视频"""
+    clip_id = get_clip_id(clip_name)
+    project_dir = project_type_info['dir']
+    subdirs = project_type_info['subdirs']
 
-    Args:
-        clip_dir: clip输出目录（包含时间戳子目录）
-        output_dir: 视频输出目录
-        fps: 帧率
-        subdirs: 要处理的子目录列表（如 ['proj', 'gt', 'compare', 'overlay', 'depth']）
-        cameras: 相机列表
-        target_resolution: 目标分辨率
-    """
-    clip_path = Path(clip_dir)
-    output_path = Path(output_dir)
-    clip_name = clip_path.name
+    # 投影输出目录
+    proj_root = Path(__file__).resolve().parent.parent
+    clip_dir = proj_root / project_dir / clip_id
 
     print(f"\n{'='*60}")
-    print(f"处理 Clip: {clip_name}")
+    print(f"处理 Clip: {clip_id}")
     print(f"{'='*60}")
 
-    # 获取所有时间戳文件夹
-    timestamp_folders = get_sorted_timestamp_folders(clip_path)
-
-    if not timestamp_folders:
-        print(f"跳过: 未找到时间戳文件夹")
+    if not clip_dir.exists():
+        print(f"  跳过: 目录不存在 {clip_dir}")
         return False
 
-    print(f"找到 {len(timestamp_folders)} 帧")
-    print(f"时间戳范围: {timestamp_folders[0].name} ~ {timestamp_folders[-1].name}")
+    # 获取时间戳文件夹
+    timestamp_folders = get_sorted_timestamp_folders(clip_dir)
+    if not timestamp_folders:
+        print(f"  跳过: 未找到时间戳文件夹")
+        return False
+
+    print(f"  找到 {len(timestamp_folders)} 帧")
+
+    # 输出目录
+    output_dir = Path(output_root) / project_dir / clip_id
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 处理每个子目录
     for subdir in subdirs:
-        print(f"\n处理子目录: {subdir}")
-
-        # 检查子目录是否存在
         first_subdir = timestamp_folders[0] / subdir
         if not first_subdir.exists():
-            print(f"  跳过: 子目录不存在 {first_subdir}")
+            print(f"  {subdir}: 子目录不存在，跳过")
             continue
 
+        print(f"  处理 {subdir}...")
+
         # 处理每个相机
-        for cam_name in cameras:
-            # 收集图像路径
+        for cam_name in CAMERA_NAMES:
             image_paths = []
             for folder in timestamp_folders:
-                # 尝试 .jpg 和 .png
                 for ext in ['.jpg', '.png']:
                     img_path = folder / subdir / f"{cam_name}{ext}"
                     if img_path.exists():
@@ -140,79 +124,146 @@ def process_clip(clip_dir, output_dir, fps, subdirs, cameras, target_resolution=
                         break
 
             if not image_paths:
-                print(f"  {cam_name}: 无图像")
                 continue
 
-            # 生成视频
-            video_filename = f"{clip_name}_{subdir}_{cam_name}.mp4"
-            video_output = output_path / subdir / video_filename
+            video_filename = f"{clip_id}_{subdir}_{cam_name}.mp4"
+            video_output = output_dir / subdir / video_filename
 
-            if create_video_from_images(image_paths, video_output, fps, target_resolution):
-                print(f"  {cam_name}: {len(image_paths)} 帧 -> {video_output}")
-            else:
-                print(f"  {cam_name}: 生成失败")
+            if create_video_from_images(image_paths, video_output, fps):
+                print(f"    {cam_name}: {len(image_paths)} 帧")
 
     return True
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Dense Projection Video Maker')
+def interactive_input():
+    """交互式输入"""
+    print("\n" + "="*60)
+    print("  Dense Projection Video Maker")
+    print("="*60)
 
-    parser.add_argument('--input-dir', type=str, required=True,
-                        help='投影输出目录（包含时间戳子目录）')
+    # 1. 选择投影类型
+    print("\n请选择投影类型:")
+    for key, info in PROJECT_TYPES.items():
+        print(f"  {key}) {info['name']}")
 
-    parser.add_argument('--output-dir', type=str, required=True,
-                        help='视频输出目录')
+    project_choice = input("\n请选择 (1-5): ").strip()
+    if project_choice not in PROJECT_TYPES:
+        print("无效选择")
+        return None
 
-    parser.add_argument('--fps', type=int, default=10,
-                        help='视频帧率（默认 10 FPS）')
+    project_type_info = PROJECT_TYPES[project_choice]
+    print(f"  选择: {project_type_info['name']}")
 
-    parser.add_argument('--subdirs', type=str, nargs='+',
-                        default=['proj', 'gt', 'compare', 'overlay'],
-                        help='要处理的子目录（默认: proj gt compare overlay）')
+    # 2. 选择方向
+    print("\n请选择方向:")
+    for key, direction in DIRECTION_CHOICES.items():
+        info = DIRECTION_CLIPS[direction]
+        print(f"  {key}) {info['name']} - {len(info['clips'])} 个clips")
 
-    parser.add_argument('--cameras', type=str, nargs='+',
-                        default=CAMERA_NAMES,
-                        help='相机列表（默认: 全部7个相机）')
+    direction_choice = input("\n请选择 (a/b/c/d): ").strip().lower()
+    if direction_choice not in DIRECTION_CHOICES:
+        print("无效选择")
+        return None
 
-    parser.add_argument('--resolution', type=str, default=None,
-                        help='目标分辨率，如 1280x720（默认: 保持原始分辨率）')
+    direction = DIRECTION_CHOICES[direction_choice]
+    clips = DIRECTION_CLIPS[direction]['clips']
 
-    args = parser.parse_args()
+    if not clips:
+        print(f"  {direction} 方向没有clips")
+        return None
 
-    # 解析分辨率
-    target_resolution = None
-    if args.resolution:
+    print(f"  选择: {DIRECTION_CLIPS[direction]['name']}")
+
+    # 3. 选择clips
+    print(f"\n可用clips ({len(clips)}个):")
+    for i, clip in enumerate(clips, 1):
+        clip_id = get_clip_id(clip)
+        print(f"  {i}. {clip_id}")
+
+    print("\n处理方式:")
+    print("  1. 处理全部")
+    print("  2. 处理范围 (如: 1-5)")
+    print("  3. 处理指定 (如: 1,3,5)")
+
+    mode = input("\n请选择: ").strip()
+
+    selected_clips = []
+    if mode == '1':
+        selected_clips = clips
+    elif mode.startswith('2') or '-' in mode:
         try:
-            w, h = args.resolution.lower().split('x')
-            target_resolution = (int(w), int(h))
+            range_str = mode.replace('2', '').strip() or input("输入范围 (如 1-5): ").strip()
+            start, end = map(int, range_str.split('-'))
+            selected_clips = clips[start-1:end]
         except:
-            print(f"警告: 无法解析分辨率 {args.resolution}，使用原始分辨率")
+            print("无效范围")
+            return None
+    elif mode.startswith('3') or ',' in mode:
+        try:
+            indices_str = mode.replace('3', '').strip() or input("输入索引 (如 1,3,5): ").strip()
+            indices = [int(x.strip()) for x in indices_str.split(',')]
+            selected_clips = [clips[i-1] for i in indices]
+        except:
+            print("无效索引")
+            return None
+    else:
+        try:
+            idx = int(mode)
+            selected_clips = [clips[idx-1]]
+        except:
+            print("无效选择")
+            return None
 
-    print("="*60)
-    print("Dense Projection Video Maker")
-    print("="*60)
-    print(f"输入目录: {args.input_dir}")
-    print(f"输出目录: {args.output_dir}")
-    print(f"帧率: {args.fps} FPS")
-    print(f"子目录: {args.subdirs}")
-    print(f"相机: {args.cameras}")
-    print(f"分辨率: {target_resolution or '原始'}")
+    # 4. 帧率
+    fps_input = input("\n帧率 (默认10): ").strip()
+    fps = int(fps_input) if fps_input else 10
 
-    # 处理
-    process_clip(
-        args.input_dir,
-        args.output_dir,
-        args.fps,
-        args.subdirs,
-        args.cameras,
-        target_resolution
-    )
+    # 5. 输出目录
+    default_output = f"/mnt/zihanw/dense_projection_videos"
+    output_input = input(f"\n输出目录 (默认 {default_output}): ").strip()
+    output_root = output_input if output_input else default_output
+
+    return {
+        'project_type_info': project_type_info,
+        'clips': selected_clips,
+        'fps': fps,
+        'output_root': output_root
+    }
+
+
+def main():
+    config = interactive_input()
+    if not config:
+        sys.exit(1)
 
     print(f"\n{'='*60}")
-    print(f"完成! 视频保存到: {args.output_dir}")
+    print(f"  处理计划:")
+    print(f"   投影类型: {config['project_type_info']['name']}")
+    print(f"   Clip数量: {len(config['clips'])}")
+    print(f"   帧率: {config['fps']} FPS")
+    print(f"   输出目录: {config['output_root']}")
+    print(f"{'='*60}")
+
+    confirm = input("\n开始处理? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("取消")
+        sys.exit(0)
+
+    # 处理每个clip
+    success_count = 0
+    for clip_name in config['clips']:
+        if process_clip(clip_name, config['project_type_info'], config['fps'], config['output_root']):
+            success_count += 1
+
+    print(f"\n{'='*60}")
+    print(f"  完成! {success_count}/{len(config['clips'])} 个clips")
+    print(f"  视频保存到: {config['output_root']}")
     print(f"{'='*60}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n用户中断")
+        sys.exit(1)
