@@ -74,18 +74,18 @@ def create_video_from_images(image_paths, output_path, fps):
     return True
 
 
-def process_clip(clip_name, project_type_info, fps, output_root):
+def process_clip(clip_name, project_type_info, fps, output_root, proj_root):
     """处理单个clip生成视频"""
     clip_id = get_clip_id(clip_name)
     project_dir = project_type_info['dir']
     subdirs = project_type_info['subdirs']
 
     # 投影输出目录
-    proj_root = Path(__file__).resolve().parent.parent
-    clip_dir = proj_root / project_dir / clip_id
+    clip_dir = Path(proj_root) / project_dir / clip_id
 
     print(f"\n{'='*60}")
     print(f"处理 Clip: {clip_id}")
+    print(f"目录: {clip_dir}")
     print(f"{'='*60}")
 
     if not clip_dir.exists():
@@ -214,18 +214,24 @@ def interactive_input():
             print("无效选择")
             return None
 
-    # 4. 帧率
+    # 4. 投影输出根目录
+    default_proj_root = "/mnt/zihanw/proj_utils_pro/dense_projection"
+    proj_root_input = input(f"\n投影输出根目录 (默认 {default_proj_root}): ").strip()
+    proj_root = proj_root_input if proj_root_input else default_proj_root
+
+    # 5. 帧率
     fps_input = input("\n帧率 (默认10): ").strip()
     fps = int(fps_input) if fps_input else 10
 
-    # 5. 输出目录
+    # 6. 视频输出目录
     default_output = f"/mnt/zihanw/dense_projection_videos"
-    output_input = input(f"\n输出目录 (默认 {default_output}): ").strip()
+    output_input = input(f"\n视频输出目录 (默认 {default_output}): ").strip()
     output_root = output_input if output_input else default_output
 
     return {
         'project_type_info': project_type_info,
         'clips': selected_clips,
+        'proj_root': proj_root,
         'fps': fps,
         'output_root': output_root
     }
@@ -240,8 +246,9 @@ def main():
     print(f"  处理计划:")
     print(f"   投影类型: {config['project_type_info']['name']}")
     print(f"   Clip数量: {len(config['clips'])}")
+    print(f"   投影输出目录: {config['proj_root']}")
     print(f"   帧率: {config['fps']} FPS")
-    print(f"   输出目录: {config['output_root']}")
+    print(f"   视频输出目录: {config['output_root']}")
     print(f"{'='*60}")
 
     confirm = input("\n开始处理? (y/n): ").strip().lower()
@@ -252,7 +259,7 @@ def main():
     # 处理每个clip
     success_count = 0
     for clip_name in config['clips']:
-        if process_clip(clip_name, config['project_type_info'], config['fps'], config['output_root']):
+        if process_clip(clip_name, config['project_type_info'], config['fps'], config['output_root'], config['proj_root']):
             success_count += 1
 
     print(f"\n{'='*60}")
