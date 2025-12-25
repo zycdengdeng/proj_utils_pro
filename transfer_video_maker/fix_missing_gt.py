@@ -96,48 +96,36 @@ def find_nearest_valid_timestamp(gt_status: dict, target_ts: int, camera: str) -
     """
     timestamps = sorted(gt_status.keys())
 
-    # 向前向后同时搜索
-    left_idx = timestamps.index(target_ts) - 1 if target_ts in timestamps else -1
-    right_idx = timestamps.index(target_ts) + 1 if target_ts in timestamps else -1
-
-    if left_idx < 0 and right_idx < 0:
+    if target_ts not in timestamps:
         return -1
 
-    while left_idx >= 0 or right_idx < len(timestamps):
-        # 检查左边
-        if left_idx >= 0:
-            left_ts = timestamps[left_idx]
-            if gt_status[left_ts]['cameras'].get(camera, False):
-                left_dist = target_ts - left_ts
-            else:
-                left_dist = float('inf')
-                left_idx -= 1
-        else:
-            left_dist = float('inf')
+    target_idx = timestamps.index(target_ts)
 
-        # 检查右边
-        if right_idx < len(timestamps):
-            right_ts = timestamps[right_idx]
-            if gt_status[right_ts]['cameras'].get(camera, False):
-                right_dist = right_ts - target_ts
-            else:
-                right_dist = float('inf')
-                right_idx += 1
-        else:
-            right_dist = float('inf')
+    # 向左右两边搜索最近的有效时间戳
+    best_ts = -1
+    best_dist = float('inf')
 
-        # 如果都找到了，返回更近的
-        if left_dist != float('inf') or right_dist != float('inf'):
-            if left_dist <= right_dist:
-                return timestamps[left_idx] if left_dist != float('inf') else -1
-            else:
-                return timestamps[right_idx - 1] if right_dist != float('inf') else -1
+    # 向左搜索
+    for i in range(target_idx - 1, -1, -1):
+        ts = timestamps[i]
+        if gt_status[ts]['cameras'].get(camera, False):
+            dist = target_ts - ts
+            if dist < best_dist:
+                best_dist = dist
+                best_ts = ts
+            break  # 找到最近的就停止
 
-        # 如果两边都没找到有效的，继续扩大搜索
-        if left_idx < 0 and right_idx >= len(timestamps):
-            break
+    # 向右搜索
+    for i in range(target_idx + 1, len(timestamps)):
+        ts = timestamps[i]
+        if gt_status[ts]['cameras'].get(camera, False):
+            dist = ts - target_ts
+            if dist < best_dist:
+                best_dist = dist
+                best_ts = ts
+            break  # 找到最近的就停止
 
-    return -1
+    return best_ts
 
 
 def fix_scene_missing_gt(scene_dir: Path, cameras: list, dry_run: bool = True) -> dict:
