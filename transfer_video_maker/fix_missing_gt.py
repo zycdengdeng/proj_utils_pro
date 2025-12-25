@@ -203,6 +203,7 @@ def fix_scene_missing_gt(scene_dir: Path, cameras: list, dry_run: bool = True) -
 
             if dry_run:
                 print(f"    [DRY] {cam} @ {target_ts}: 将从 {nearest_ts} 复制 (距离: {distance}ms)")
+                fixed_count += 1  # dry_run模式也计数
             else:
                 try:
                     shutil.copy2(source_path, target_path)
