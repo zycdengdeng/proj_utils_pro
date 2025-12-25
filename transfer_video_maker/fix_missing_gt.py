@@ -30,9 +30,13 @@ def get_timestamp_from_folder(folder_name: str) -> int:
         return -1
 
 
-def scan_scene_gt_status(scene_dir: Path) -> dict:
+def scan_scene_gt_status(scene_dir: Path, cameras: list) -> dict:
     """
     扫描场景目录，获取每个时间戳每个相机的GT状态
+
+    Args:
+        scene_dir: 场景目录路径
+        cameras: 需要检查的相机列表
 
     Returns:
         {
@@ -66,7 +70,7 @@ def scan_scene_gt_status(scene_dir: Path) -> dict:
         gt_folder = ts_folder / 'gt'
 
         camera_status = {}
-        for cam in CAMERA_NAMES:
+        for cam in cameras:
             gt_image = gt_folder / f"{cam}.jpg"
             camera_status[cam] = gt_image.exists()
 
@@ -136,12 +140,13 @@ def find_nearest_valid_timestamp(gt_status: dict, target_ts: int, camera: str) -
     return -1
 
 
-def fix_scene_missing_gt(scene_dir: Path, dry_run: bool = True) -> dict:
+def fix_scene_missing_gt(scene_dir: Path, cameras: list, dry_run: bool = True) -> dict:
     """
     修复场景中缺失的GT图像
 
     Args:
         scene_dir: 场景目录路径
+        cameras: 需要检查的相机列表
         dry_run: 如果为True，只报告不实际复制
 
     Returns:
@@ -153,7 +158,7 @@ def fix_scene_missing_gt(scene_dir: Path, dry_run: bool = True) -> dict:
     print(f"{'='*60}")
 
     # 扫描GT状态
-    gt_status = scan_scene_gt_status(scene_dir)
+    gt_status = scan_scene_gt_status(scene_dir, cameras)
 
     if not gt_status:
         print(f"  未找到有效的时间戳文件夹")
@@ -170,7 +175,7 @@ def fix_scene_missing_gt(scene_dir: Path, dry_run: bool = True) -> dict:
 
     # 显示缺失统计
     print(f"\n  缺失统计:")
-    for cam in CAMERA_NAMES:
+    for cam in cameras:
         missing_count = len(missing_stats[cam])
         total_count = len(gt_status)
         if missing_count > 0:
@@ -253,9 +258,8 @@ def main():
     print(f"相机列表: {', '.join(args.cameras)}")
     print(f"模式: {'DRY RUN (仅报告)' if args.dry_run else '实际修复'}")
 
-    # 更新全局相机列表
-    global CAMERA_NAMES
-    CAMERA_NAMES = args.cameras
+    # 使用用户指定的相机列表
+    cameras_to_check = args.cameras
 
     # 处理每个场景
     total_fixed = 0
@@ -268,7 +272,7 @@ def main():
             print(f"\n警告: 场景目录不存在 {scene_dir}")
             continue
 
-        result = fix_scene_missing_gt(scene_dir, dry_run=args.dry_run)
+        result = fix_scene_missing_gt(scene_dir, cameras_to_check, dry_run=args.dry_run)
         total_fixed += result['fixed']
         total_failed += result['failed']
 
