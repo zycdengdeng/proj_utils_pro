@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-去畸变版投影：多线程CPU优化版 V2 - depth投影
-统一变换逻辑：世界坐标系 → LiDAR坐标系 → 相机坐标系
+去畸变版投影：多线程CPU优化版 V2 - depth投影 (路侧标定版 lableRoadside)
+新流程：世界坐标系 (≈VirtualLidar) → virtualLidarToCam (单个路侧相机) → 图像
 输出深度图：近白远黑，无点区域纯黑色（.npy + .jpg）
 """
 
 import json
-import yaml
 import numpy as np
 import cv2
 import open3d as o3d
 from pathlib import Path
 import argparse
-from scipy.spatial.transform import Rotation as R
 import warnings
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,186 +20,115 @@ import sys
 import os
 import re
 
-# 添加父目录到路径以导入 common_utils（使用绝对路径）
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import common_utils
-
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# 车端相机配置
-VEHICLE_CAMERAS = {
-    1: {"name": "FN", "desc": "前视窄角30°", "resolution": (3840, 2160)},
-    2: {"name": "FW", "desc": "前视广角120°", "resolution": (3840, 2160)},
-    3: {"name": "FL", "desc": "左前视120°", "resolution": (3840, 2160)},
-    4: {"name": "FR", "desc": "右前视120°", "resolution": (3840, 2160)},
-    5: {"name": "RL", "desc": "左后视60°", "resolution": (1920, 1080)},
-    6: {"name": "RR", "desc": "右后视60°", "resolution": (1920, 1080)},
-    7: {"name": "RN", "desc": "后视60°", "resolution": (1920, 1080)}
-}
 
-def quaternion_to_rotation_matrix(q):
-    """四元数转旋转矩阵"""
-    x, y, z, w = q
-    R = np.array([
-        [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
-        [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
-        [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]
-    ])
+def rodrigues_to_R(rvec3):
+    """罗德里格斯向量转旋转矩阵"""
+    r = np.asarray(rvec3, dtype=np.float64).reshape(3)
+    R, _ = cv2.Rodrigues(r)
     return R
 
 
-def find_gt_image(gt_images_folder, camera_name, timestamp_ms):
-    """找到最接近的真值图片"""
-    camera_folder = Path(gt_images_folder) / camera_name
+def find_roadside_gt_image(roadside_images_folder, cam_id, timestamp_ms, max_time_diff_ms=1000):
+    """找到路侧相机图像"""
+    roadside_images_folder = Path(roadside_images_folder)
+
+    # 优先映射关系
+    cam_id_to_pinhole = {"3": "pinhole0", "6": "pinhole1", "9": "pinhole2", "0": "pinhole3"}
+    pinhole_name = cam_id_to_pinhole.get(str(cam_id))
+
+    # 如果映射不存在，尝试搜索
+    if pinhole_name is None:
+        for folder in roadside_images_folder.iterdir():
+            if folder.is_dir() and folder.name.startswith("pinhole"):
+                files = list(folder.glob(f"cam{cam_id}_*.png"))
+                if files:
+                    pinhole_name = folder.name
+                    break
+
+    if pinhole_name is None:
+        return None, None
+
+    camera_folder = roadside_images_folder / pinhole_name
     if not camera_folder.exists():
-        return None
+        return None, None
 
-    target_timestamp_us = timestamp_ms * 1000
+    # 精确匹配
+    img_path = camera_folder / f"cam{cam_id}_{int(timestamp_ms)}.png"
+    if img_path.exists():
+        return img_path, 0
 
-    jpg_files = list(camera_folder.glob("*.jpg"))
-    closest_file = None
-    min_diff = float('inf')
+    # 模糊匹配
+    png_files = list(camera_folder.glob(f"cam{cam_id}_*.png"))
+    if not png_files:
+        return None, None
 
-    for jpg_file in jpg_files:
-        match = re.search(r'_(\d+)\.(\d+)\.jpg$', jpg_file.name)
-        if match:
-            seconds = int(match.group(1))
-            microseconds = int(match.group(2))
-            timestamp_us = seconds * 1000000 + microseconds
-
-            diff = abs(timestamp_us - target_timestamp_us)
+    closest_file, min_diff = None, float('inf')
+    for f in png_files:
+        m = re.search(r'_(\d+)\.png$', f.name)
+        if m:
+            diff = abs(int(m.group(1)) - timestamp_ms)
             if diff < min_diff:
                 min_diff = diff
-                closest_file = jpg_file
+                closest_file = f
 
-    return closest_file
+    if closest_file and min_diff <= max_time_diff_ms:
+        return closest_file, min_diff
+
+    return None, min_diff if closest_file else None
 
 
 class DepthProjectorMultiThread:
-    def __init__(self, roadside_calib_path, vehicle_calib_folder, gt_images_folder, transforms):
+    def __init__(self, roadside_calib_path, roadside_images_folder, camera_id):
         """
         初始化投影器
 
         Args:
             roadside_calib_path: 路侧标定文件路径
-            vehicle_calib_folder: 车端标定文件夹路径
-            gt_images_folder: 真值图像文件夹
-            transforms: world2lidar 变换矩阵列表
+            roadside_images_folder: 路侧图像文件夹
+            camera_id: 相机ID（如 "3", "6", "9", "0"）
         """
         with open(roadside_calib_path, 'r') as f:
             self.roadside_calib = json.load(f)
-        self.vehicle_calib_folder = Path(vehicle_calib_folder)
-        self.gt_images_folder = Path(gt_images_folder)
-        self.transforms = transforms
-        self.camera_poses = {}
-        self.camera_params = {}
+
+        self.roadside_images_folder = Path(roadside_images_folder)
+        self.camera_id = str(camera_id)
+
+        # 验证相机ID
+        if self.camera_id not in self.roadside_calib["camera"]:
+            available_ids = list(self.roadside_calib["camera"].keys())
+            raise ValueError(f"相机ID '{self.camera_id}' 不存在于calib.json中。可用的相机ID: {available_ids}")
+
+        # 加载相机参数
+        cam_config = self.roadside_calib["camera"][self.camera_id]
+
+        self.K = np.asarray(cam_config["intri"], dtype=np.float64).reshape(3, 3)
+        self.D = np.asarray(cam_config.get("distor", []), dtype=np.float64).reshape(-1) if "distor" in cam_config else None
+        self.is_fisheye = bool(cam_config.get("isFish", 0))
+
+        self.R_V2C = rodrigues_to_R(cam_config["virtualLidarToCam"]["rotate"])
+        self.t_V2C = np.asarray(cam_config["virtualLidarToCam"]["trans"], dtype=np.float64).reshape(3, 1)
+
+        if self.is_fisheye:
+            self.resolution = tuple(self.roadside_calib["imgSize"]["fish"])
+        else:
+            self.resolution = tuple(self.roadside_calib["imgSize"]["notFish"])
 
         # 设置OpenCV线程数
-        cv2.setNumThreads(0)  # 让每个线程独立使用OpenCV
+        cv2.setNumThreads(0)
 
-    def get_world2lidar_transform(self, timestamp_ms):
-        """获取 world2lidar 变换矩阵"""
-        transform = common_utils.find_closest_transform(timestamp_ms, self.transforms)
-
-        if transform is None:
-            raise ValueError(f"未找到时间戳 {timestamp_ms} 对应的变换矩阵")
-
-        rotation = np.array(transform['world2lidar']['rotation']).reshape((3, 1))
-        translation = np.array(transform['world2lidar']['translation']).reshape((3, 1))
-
-        return rotation, translation
-
-    def load_camera_params(self, cam_id):
-        """加载车端相机参数（使用固定标定路径）"""
-        with open(self.vehicle_calib_folder / f"camera_{cam_id:02d}_intrinsics.yaml", 'r') as f:
-            intrinsics = yaml.safe_load(f)
-        K = np.array(intrinsics['K']).reshape(3, 3)
-        D = np.array(intrinsics['D'])
-
-        with open(self.vehicle_calib_folder / f"camera_{cam_id:02d}_extrinsics.yaml", 'r') as f:
-            extrinsics = yaml.safe_load(f)
-
-        transform = extrinsics['transform']
-        q = [transform['rotation']['x'], transform['rotation']['y'],
-             transform['rotation']['z'], transform['rotation']['w']]
-        t = np.array([transform['translation']['x'],
-                     transform['translation']['y'],
-                     transform['translation']['z']])
-        R_cam = quaternion_to_rotation_matrix(q)
-
-        self.camera_poses[cam_id] = {
-            'R': R_cam,
-            't': t,
-            'label': extrinsics.get('label', ''),
-            'name': VEHICLE_CAMERAS[cam_id]['name']
-        }
-
-        self.camera_params[cam_id] = {
-            'K': K,
-            'D': D,
-            'resolution': VEHICLE_CAMERAS[cam_id]["resolution"]
-        }
-
-        return K, D, R_cam, t
-
-    def undistort_gt_image(self, gt_image_path, cam_id, output_path):
-        """对真值图像进行去畸变"""
-        if not gt_image_path or not gt_image_path.exists():
-            return False
-
-        img = cv2.imread(str(gt_image_path))
-        if img is None:
-            return False
-
-        K = self.camera_params[cam_id]['K']
-        D = self.camera_params[cam_id]['D']
-        w, h = self.camera_params[cam_id]['resolution']
-
-        if cam_id in [2, 3, 4] and np.max(np.abs(D)) > 1:
-            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                K, D[:4], (w, h), np.eye(3), balance=0.0
-            )
-            map1, map2 = cv2.fisheye.initUndistortRectifyMap(
-                K, D[:4], np.eye(3), new_K, (w, h), cv2.CV_16SC2
-            )
-            undistorted = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
-        else:
-            new_K, roi = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 0, (w, h))
-            undistorted = cv2.undistort(img, K, D, None, new_K)
-
-        cv2.imwrite(str(output_path), undistorted, [cv2.IMWRITE_JPEG_QUALITY, 100])
-        return True
-
-    def project_to_camera_depth(self, points, colors, rotate_world2lidar,
-                                trans_world2lidar, cam_id):
+    def project_to_camera_depth(self, points):
         """
-        投影到去畸变的相机平面并生成深度图
+        投影到相机平面并生成深度图
 
         深度图要求：近白远黑，无点区域纯黑色
-        变换流程：世界坐标系 → LiDAR坐标系 → 相机坐标系 → 图像坐标系
+        变换流程：世界坐标系 (≈VirtualLidar) → virtualLidarToCam → 图像坐标系
         """
-        cam_info = VEHICLE_CAMERAS[cam_id]
-        img_w, img_h = cam_info["resolution"]
+        img_w, img_h = self.resolution
 
-        K = self.camera_params[cam_id]['K']
-        D = self.camera_params[cam_id]['D']
-        R_cam2lidar = self.camera_poses[cam_id]['R']
-        t_cam2lidar = self.camera_poses[cam_id]['t']
-
-        # 步骤1: 世界坐标系 → LiDAR坐标系
-        points_lidar = common_utils.transform_points_to_lidar(
-            points[:, :3],
-            {'world2lidar': {
-                'rotation': rotate_world2lidar.flatten().tolist(),
-                'translation': trans_world2lidar.flatten().tolist()
-            }}
-        )
-
-        # 步骤2: LiDAR坐标系 → 相机坐标系
-        R_lidar2cam = R_cam2lidar.T
-        t_lidar2cam = -R_cam2lidar.T @ t_cam2lidar
-
-        points_cam = (R_lidar2cam @ points_lidar.T).T + t_lidar2cam
+        # 变换：VirtualLidar → Camera
+        points_cam = (self.R_V2C @ points.T).T + self.t_V2C.T
 
         # 过滤背后的点
         valid = points_cam[:, 2] > 0.1
@@ -213,22 +140,30 @@ class DepthProjectorMultiThread:
         points_valid = points_cam[valid]
         depths = points_valid[:, 2]  # z值即为深度
 
-        # 步骤3: 相机坐标系 → 图像坐标系（去畸变投影）
-        if cam_id in [2, 3, 4] and np.max(np.abs(D)) > 1:
-            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                K, D[:4], (img_w, img_h), np.eye(3), balance=0.0
-            )
-        else:
-            new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (img_w, img_h), 0, (img_w, img_h))
+        # 投影：Camera → Image
+        if self.D is not None and len(self.D) > 0:
+            rvec = np.zeros(3)
+            tvec = np.zeros(3)
 
-        uv_homogeneous = (new_K @ points_valid.T).T
-        z_proj = uv_homogeneous[:, 2]
-        uv = (uv_homogeneous[:, :2] / z_proj[:, np.newaxis]).astype(int)
+            if self.is_fisheye and len(self.D) >= 4:
+                uv, _ = cv2.fisheye.projectPoints(
+                    points_valid.reshape(-1, 1, 3),
+                    rvec, tvec, self.K, self.D[:4]
+                )
+            else:
+                uv, _ = cv2.projectPoints(
+                    points_valid.reshape(-1, 1, 3),
+                    rvec, tvec, self.K, self.D
+                )
+            uv = uv.reshape(-1, 2)
+        else:
+            uv_homogeneous = (self.K @ points_valid.T).T
+            uv = uv_homogeneous[:, :2] / uv_homogeneous[:, 2:3]
 
         # 过滤有效投影点
         valid_proj = (uv[:, 0] >= 0) & (uv[:, 0] < img_w) & \
                     (uv[:, 1] >= 0) & (uv[:, 1] < img_h)
-        uv_valid = uv[valid_proj]
+        uv_valid = uv[valid_proj].astype(int)
         depths_valid = depths[valid_proj]
 
         # 创建深度图（原始值）
@@ -258,70 +193,17 @@ class DepthProjectorMultiThread:
 
         return depth_raw, depth_vis, len(uv_valid)
 
-    def process_single_camera(self, cam_id, points, colors, rotate_world2lidar,
-                             trans_world2lidar, timestamp_ms, depth_dir, gt_dir,
-                             compare_dir, overlay_dir):
-        """处理单个相机（用于多线程）"""
-        cam_name = VEHICLE_CAMERAS[cam_id]['name']
-
-        results = {'cam_name': cam_name, 'depth_vis': None, 'gt_img': None, 'count': 0}
-
-        # 处理GT图像
-        gt_image_path = find_gt_image(self.gt_images_folder, cam_name, timestamp_ms)
-        if gt_image_path:
-            gt_output = gt_dir / f"{cam_name}.jpg"
-            if self.undistort_gt_image(gt_image_path, cam_id, gt_output):
-                results['gt_img'] = cv2.imread(str(gt_output))
-
-        # 投影生成深度图
-        depth_raw, depth_vis, count = self.project_to_camera_depth(
-            points, colors, rotate_world2lidar, trans_world2lidar, cam_id
-        )
-
-        # 保存深度图（.npy原始值 + .jpg可视化）
-        depth_npy_output = depth_dir / f"{cam_name}.npy"
-        depth_jpg_output = depth_dir / f"{cam_name}.jpg"
-        np.save(str(depth_npy_output), depth_raw)
-        cv2.imwrite(str(depth_jpg_output), depth_vis, [cv2.IMWRITE_JPEG_QUALITY, 100])
-
-        results['depth_vis'] = depth_vis
-        results['count'] = count
-
-        # 生成compare图（GT和深度图左右对比）
-        if results['gt_img'] is not None:
-            gt_img = results['gt_img']
-            # 将深度图转换为3通道用于对比
-            depth_vis_color = cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)
-            compare_img = np.hstack([gt_img, depth_vis_color])
-            compare_output = compare_dir / f"{cam_name}.jpg"
-            cv2.imwrite(str(compare_output), compare_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
-
-        # 生成overlay图（深度图叠加到GT上，使用伪彩色）
-        if results['gt_img'] is not None:
-            gt_img = results['gt_img']
-            # 将深度图应用伪彩色
-            depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            # 叠加：有深度的地方用彩色深度图
-            overlay_img = gt_img.copy()
-            mask = depth_vis > 0
-            overlay_img[mask] = depth_colored[mask]
-            overlay_output = overlay_dir / f"{cam_name}.jpg"
-            cv2.imwrite(str(overlay_output), overlay_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
-
-        return results
-
-    def process_single_frame(self, pcd_path, output_dir, timestamp_ms, num_threads=7):
+    def process_single_frame(self, pcd_path, output_dir, timestamp_ms):
         """
-        处理单帧数据（多线程）
+        处理单帧数据
 
         Args:
             pcd_path: PCD文件路径
             output_dir: 输出目录
             timestamp_ms: 时间戳（毫秒）
-            num_threads: 线程数
         """
         output_dir = Path(output_dir)
-        depth_dir = output_dir / "depth"  # 深度图目录
+        depth_dir = output_dir / "depth"
         gt_dir = output_dir / "gt"
         compare_dir = output_dir / "compare"
         overlay_dir = output_dir / "overlay"
@@ -334,59 +216,67 @@ class DepthProjectorMultiThread:
         # 1. 加载点云
         pcd = o3d.io.read_point_cloud(str(pcd_path))
         points = np.asarray(pcd.points)
-        colors = np.asarray(pcd.colors) if pcd.has_colors() else np.ones((len(points), 3)) * 0.5
 
-        # 2. 获取 world2lidar 变换
-        try:
-            rotate_world2lidar, trans_world2lidar = self.get_world2lidar_transform(timestamp_ms)
-        except ValueError as e:
-            print(f"❌ {e}")
-            return False
+        # 2. 投影生成深度图
+        depth_raw, depth_vis, count = self.project_to_camera_depth(points)
 
-        # 3. 加载相机参数
-        for cam_id in range(1, 8):
-            if cam_id not in self.camera_params:
-                self.load_camera_params(cam_id)
+        # 3. 保存深度图（.npy原始值 + .jpg可视化）
+        cam_name = f"cam{self.camera_id}"
+        depth_npy_output = depth_dir / f"{cam_name}.npy"
+        depth_jpg_output = depth_dir / f"{cam_name}.jpg"
+        np.save(str(depth_npy_output), depth_raw)
+        cv2.imwrite(str(depth_jpg_output), depth_vis, [cv2.IMWRITE_JPEG_QUALITY, 100])
 
-        # 4. 多线程处理每个相机
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for cam_id in range(1, 8):
-                future = executor.submit(
-                    self.process_single_camera,
-                    cam_id, points, colors, rotate_world2lidar,
-                    trans_world2lidar, timestamp_ms, depth_dir, gt_dir,
-                    compare_dir, overlay_dir
-                )
-                futures.append(future)
+        # 4. 处理GT图像
+        gt_image_path, time_diff = find_roadside_gt_image(
+            self.roadside_images_folder, self.camera_id, timestamp_ms
+        )
 
-            # 收集结果
-            for future in futures:
-                result = future.result()
+        gt_img = None
+        if gt_image_path:
+            gt_output = gt_dir / f"{cam_name}.jpg"
+            img = cv2.imread(str(gt_image_path))
+            if img is not None:
+                cv2.imwrite(str(gt_output), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                gt_img = img
+                if time_diff > 0:
+                    print(f"  GT图像时间差: {time_diff}ms")
+
+        # 5. 生成compare图（GT和深度图左右对比）
+        if gt_img is not None:
+            depth_vis_color = cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)
+            compare_img = np.hstack([gt_img, depth_vis_color])
+            compare_output = compare_dir / f"{cam_name}.jpg"
+            cv2.imwrite(str(compare_output), compare_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+
+        # 6. 生成overlay图（深度图叠加到GT上，使用伪彩色）
+        if gt_img is not None:
+            depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+            overlay_img = gt_img.copy()
+            mask = depth_vis > 0
+            overlay_img[mask] = depth_colored[mask]
+            overlay_output = overlay_dir / f"{cam_name}.jpg"
+            cv2.imwrite(str(overlay_output), overlay_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
 
         return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="多线程优化去畸变版投影 V2 - Depth投影")
+    parser = argparse.ArgumentParser(description="多线程优化去畸变版投影 V2 - Depth投影 (路侧标定版)")
     parser.add_argument("--roadside-calib", type=str, required=True)
-    parser.add_argument("--vehicle-calib", type=str, required=True)
-    parser.add_argument("--gt-images", type=str, required=True)
+    parser.add_argument("--roadside-images", type=str, required=True)
+    parser.add_argument("--camera-id", type=str, required=True, help="路侧相机ID (如 3, 6, 9, 0)")
     parser.add_argument("--pcd", type=str, required=True)
-    parser.add_argument("--transform-json", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--timestamp", type=int, required=True)
-    parser.add_argument("--num-threads", type=int, default=7, help="每帧使用的线程数")
 
     args = parser.parse_args()
 
-    transforms = common_utils.load_world2lidar_transforms(args.transform_json)
-
     projector = DepthProjectorMultiThread(
-        args.roadside_calib, args.vehicle_calib, args.gt_images, transforms
+        args.roadside_calib, args.roadside_images, args.camera_id
     )
     projector.process_single_frame(
-        args.pcd, args.output_dir, args.timestamp, args.num_threads
+        args.pcd, args.output_dir, args.timestamp
     )
 
 if __name__ == "__main__":

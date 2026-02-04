@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批量blur投影处理 V2 - 统一交互版
-支持多场景、统一批次选择、固定标定路径
-使用路侧相机着色，投影到车端相机
+批量blur投影处理 V2 - 路侧标定版 (lableRoadside)
+支持多场景、统一批次选择、路侧相机投影
+使用路侧相机着色，投影到单个路侧相机
 """
 
 import os
@@ -24,8 +24,7 @@ PROJECTOR_SCRIPT = Path(__file__).resolve().parent / "undistort_projection_multi
 
 def run_single_projection(args):
     """运行单个投影任务"""
-    pcd_path, timestamp_ms, output_dir, roadside_calib, roadside_images, \
-    vehicle_calib, gt_images_folder, transform_json, threads_per_frame = args
+    pcd_path, timestamp_ms, output_dir, roadside_calib, roadside_images_folder, camera_id = args
 
     try:
         # 动态导入核心模块
@@ -34,24 +33,14 @@ def run_single_projection(args):
         projector_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(projector_module)
 
-        # 加载变换矩阵（每个进程加载一次）
-        if not hasattr(run_single_projection, 'transforms_cache'):
-            run_single_projection.transforms_cache = {}
-
-        if transform_json not in run_single_projection.transforms_cache:
-            run_single_projection.transforms_cache[transform_json] = \
-                common_utils.load_world2lidar_transforms(transform_json, show_range=False)
-
-        transforms = run_single_projection.transforms_cache[transform_json]
-
         # 创建投影器
         projector = projector_module.BlurProjectorMultiThread(
-            roadside_calib, roadside_images, vehicle_calib, gt_images_folder, transforms
+            roadside_calib, roadside_images_folder, camera_id
         )
 
         # 处理单帧
         success = projector.process_single_frame(
-            pcd_path, output_dir, timestamp_ms, threads_per_frame
+            pcd_path, output_dir, timestamp_ms
         )
 
         return success, "成功" if success else "处理失败", timestamp_ms
@@ -61,33 +50,16 @@ def run_single_projection(args):
         return False, error_msg[:100], timestamp_ms
 
 
-def get_scene_transform_json(config, scene_id):
-    """获取场景对应的transform JSON路径"""
-    transform_json = config['transform_json']
-
-    # 如果是字典，根据scene_id获取对应路径
-    if isinstance(transform_json, dict):
-        return transform_json.get(scene_id)
-    # 如果是字符串，直接返回（所有场景共用）
-    return transform_json
-
-
-def process_single_scene(scene_id, config, num_processes, threads_per_frame, project_root):
+def process_single_scene(scene_id, config, num_processes, camera_id, project_root):
     """处理单个场景"""
     print(f"\n{'='*80}")
     print(f"开始处理场景: {scene_id}")
+    print(f"目标相机ID: {camera_id}")
     print(f"{'='*80}")
-
-    # 获取当前场景的transform JSON路径
-    scene_transform_json = get_scene_transform_json(config, scene_id)
-    if not scene_transform_json:
-        print(f"❌ 场景 {scene_id} 缺少transform JSON路径")
-        return
 
     # 为当前场景创建独立的输出目录
     output_root = Path(project_root) / scene_id
     print(f"📂 输出目录: {output_root}")
-    print(f"📄 Transform JSON: {scene_transform_json}")
 
     # 获取场景路径
     scene_paths = common_utils.get_scene_paths(scene_id)
@@ -126,9 +98,6 @@ def process_single_scene(scene_id, config, num_processes, threads_per_frame, pro
         print(f"   PCD时间戳范围: {min(pcd_timestamps):.0f} ~ {max(pcd_timestamps):.0f}")
         print(f"   PCD时间跨度: {(max(pcd_timestamps) - min(pcd_timestamps)) / 1000:.1f} 秒")
 
-    # 加载并显示transform时间戳范围
-    transforms = common_utils.load_world2lidar_transforms(scene_transform_json, show_range=True)
-
     # 创建输出目录
     output_paths = common_utils.get_unified_output_paths(output_root, scene_id, 'blur')
     common_utils.create_output_dirs(output_paths)
@@ -150,15 +119,12 @@ def process_single_scene(scene_id, config, num_processes, threads_per_frame, pro
             int(timestamp_ms),
             str(output_frame_dir),
             scene_paths['roadside_calib'],
-            scene_paths['roadside_images'],  # 路侧图像文件夹
-            scene_paths['vehicle_calib'],
-            scene_paths.get('vehicle_images', scene_paths['roadside_images']),  # GT图像
-            scene_transform_json,
-            threads_per_frame
+            scene_paths['roadside_images'],
+            camera_id
         ))
 
     # 多进程处理
-    print(f"\n🚀 开始处理 ({num_processes}进程 × {threads_per_frame}线程)...")
+    print(f"\n🚀 开始处理 ({num_processes}进程, 相机ID={camera_id})...")
     success_count = 0
     failed_list = []
     start_time = time.time()
@@ -176,7 +142,7 @@ def process_single_scene(scene_id, config, num_processes, threads_per_frame, pro
 
                     if success:
                         success_count += 1
-                        tqdm.write(f"✓ {timestamp_ms}")
+                        tqdm.write(f"✓ {timestamp_ms} (cam{camera_id})")
                     else:
                         failed_list.append((timestamp_ms, message))
                         tqdm.write(f"✗ {timestamp_ms} - {message}")
@@ -194,7 +160,7 @@ def process_single_scene(scene_id, config, num_processes, threads_per_frame, pro
 
     # 结果统计
     print(f"\n{'='*80}")
-    print(f"场景 {scene_id} 处理完成")
+    print(f"场景 {scene_id} 处理完成 (相机ID={camera_id})")
     print(f"{'='*80}")
     print(f"成功: {success_count}/{len(tasks)} ({success_count/len(tasks)*100:.1f}%)")
     print(f"耗时: {elapsed_time/60:.1f} 分钟")
@@ -214,7 +180,7 @@ def process_single_scene(scene_id, config, num_processes, threads_per_frame, pro
 
 def main():
     print("\n" + "="*80)
-    print("🎯 Blur投影 - 批量处理工具 V2 (路侧着色)")
+    print("🎯 Blur投影 - 批量处理工具 V2 (路侧标定版 lableRoadside)")
     print("="*80)
 
     if not PROJECTOR_SCRIPT.exists():
@@ -231,7 +197,12 @@ def main():
     # 并行配置（支持批量模式）
     parallel_config = common_utils.get_parallel_config(batch_mode_enabled=batch_mode)
     num_processes = parallel_config['num_processes']
-    threads_per_frame = parallel_config['threads_per_frame']
+
+    # 获取路侧相机ID
+    camera_id = common_utils.get_roadside_camera_id_input(batch_mode_enabled=batch_mode)
+    if not camera_id:
+        print("❌ 相机ID输入失败")
+        sys.exit(1)
 
     # 输出根目录（固定为当前项目目录）
     output_root = Path(__file__).resolve().parent
@@ -242,7 +213,8 @@ def main():
     print(f"   场景数量: {len(config['scene_ids'])}")
     print(f"   场景列表: {', '.join(config['scene_ids'])}")
     print(f"   批次模式: {config['batch_mode']}")
-    print(f"   并行配置: {num_processes}进程 × {threads_per_frame}线程")
+    print(f"   并行配置: {num_processes}进程")
+    print(f"   相机ID: {camera_id}")
     print(f"   输出目录: {output_root}/{{场景ID}}/")
     print(f"{'='*80}")
 
@@ -256,7 +228,7 @@ def main():
 
     for scene_id in config['scene_ids']:
         process_single_scene(
-            scene_id, config, num_processes, threads_per_frame, output_root
+            scene_id, config, num_processes, camera_id, output_root
         )
 
     overall_elapsed = time.time() - overall_start
@@ -268,6 +240,7 @@ def main():
     print(f"场景数量: {len(config['scene_ids'])}")
     print(f"总耗时: {overall_elapsed/60:.1f} 分钟")
     print(f"输出目录: {output_root}/")
+    print(f"相机ID: {camera_id}")
     print(f"{'='*80}\n")
 
 
