@@ -781,6 +781,115 @@ def load_carid_mapping(carid_json_path: Optional[str] = None) -> Dict[str, int]:
         return {}
 
 
+# ==================== 路侧标定Camera ID管理 ====================
+def load_roadside_calib(calib_path: Optional[str] = None) -> Dict:
+    """
+    加载路侧标定文件
+
+    Args:
+        calib_path: calib.json路径，默认使用 ROADSIDE_CALIB_FILE
+
+    Returns:
+        标定数据字典
+    """
+    if calib_path is None:
+        calib_path = ROADSIDE_CALIB_FILE
+
+    if not os.path.exists(calib_path):
+        raise FileNotFoundError(f"路侧标定文件不存在: {calib_path}")
+
+    with open(calib_path, 'r') as f:
+        calib_data = json.load(f)
+
+    return calib_data
+
+
+def get_available_roadside_camera_ids(calib_path: Optional[str] = None) -> List[str]:
+    """
+    获取路侧标定文件中所有可用的camera ID
+
+    Args:
+        calib_path: calib.json路径
+
+    Returns:
+        可用的camera ID列表
+    """
+    calib_data = load_roadside_calib(calib_path)
+    camera_ids = list(calib_data.get("camera", {}).keys())
+    return camera_ids
+
+
+def validate_roadside_camera_id(camera_id: str, calib_path: Optional[str] = None) -> bool:
+    """
+    验证camera ID是否存在于路侧标定文件中
+
+    Args:
+        camera_id: 要验证的camera ID
+        calib_path: calib.json路径
+
+    Returns:
+        是否有效
+    """
+    available_ids = get_available_roadside_camera_ids(calib_path)
+    return str(camera_id) in available_ids
+
+
+def get_roadside_camera_id_input(calib_path: Optional[str] = None,
+                                  batch_mode_enabled: bool = False) -> str:
+    """
+    交互式获取路侧标定camera ID
+
+    Args:
+        calib_path: calib.json路径
+        batch_mode_enabled: 是否批量模式
+
+    Returns:
+        用户选择的camera ID
+    """
+    # 批量模式：从配置文件读取
+    if batch_mode_enabled:
+        config = load_batch_config()
+        if config and 'roadside_camera_id' in config:
+            camera_id = config['roadside_camera_id']
+            print(f"\n📷 路侧标定Camera ID:")
+            print(f"   使用已保存的配置: {camera_id}")
+            return camera_id
+
+    # 获取可用ID列表
+    try:
+        available_ids = get_available_roadside_camera_ids(calib_path)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        return None
+
+    if not available_ids:
+        print(f"❌ 标定文件中没有找到任何camera ID")
+        return None
+
+    print(f"\n📷 路侧标定Camera ID配置:")
+    print(f"   标定文件中可用的ID: {', '.join(available_ids)}")
+    camera_id = input(f"   请输入要使用的Camera ID: ").strip()
+
+    if not camera_id:
+        print(f"❌ 未输入Camera ID")
+        return None
+
+    if str(camera_id) not in available_ids:
+        print(f"❌ Camera ID '{camera_id}' 不存在于标定文件中")
+        print(f"   可用的ID: {', '.join(available_ids)}")
+        return None
+
+    print(f"   ✓ 使用Camera ID: {camera_id}")
+
+    # 保存到配置文件
+    config = load_batch_config()
+    if config:
+        config['roadside_camera_id'] = camera_id
+        save_batch_config(config)
+
+    return camera_id
+
+
 # ==================== 工具函数 ====================
 def extract_timestamp_from_filename(filename: str) -> Optional[float]:
     """
