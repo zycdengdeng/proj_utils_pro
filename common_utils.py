@@ -454,16 +454,6 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
         if config:
             print("\n✓ 使用已保存的配置:")
             print(f"   场景: {', '.join(config['scene_ids'])}")
-
-            # 显示JSON配置（可能是字典或字符串）
-            transform_json = config['transform_json']
-            if isinstance(transform_json, dict):
-                print(f"   JSON: 每个场景使用各自的JSON文件")
-                for scene_id, json_path in transform_json.items():
-                    print(f"      {scene_id}: {json_path}")
-            else:
-                print(f"   JSON: {transform_json}")
-
             print(f"   批次: {config['batch_mode']}")
             print(f"{'='*60}\n")
             return config
@@ -471,11 +461,11 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
             print("\n⚠️  未找到批量配置文件，切换到交互式输入\n")
 
     print("\n" + "="*60)
-    print("🚀 投影处理系统 - 统一交互界面")
+    print("🚀 投影处理系统 - 统一交互界面 (路侧标定版 lableRoadside)")
     print("="*60)
 
     # 1. 输入场景ID（支持多个）
-    print("\n📁 步骤 1/3: 输入场景ID")
+    print("\n📁 步骤 1/2: 输入场景ID")
     print("   提示：可以输入多个场景ID，用空格分隔")
     print("   示例：002 004 005")
     scene_input = input("   请输入场景ID: ").strip()
@@ -501,67 +491,8 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
         print("❌ 没有有效的场景")
         return None
 
-    # 2. 自动查找或手动输入world2lidar变换JSON路径
-    print("\n🔄 步骤 2/3: 选择world2lidar变换JSON路径")
-    print("   选项：")
-    print("     - auto    : 自动查找（从 transform_json/{场景ID}/world2lidar_transforms.json）")
-    print("     - manual  : 手动输入路径")
-    json_mode = input("   请选择模式 [auto]: ").strip() or "auto"
-
-    if json_mode == "auto":
-        # 自动查找模式
-        print("\n   使用自动查找模式...")
-        json_base_dir = Path(__file__).resolve().parent / "transform_json"
-
-        # 为每个场景查找对应的JSON文件
-        transform_jsons = {}
-        all_valid = True
-
-        for scene_id in valid_scenes:
-            json_path = json_base_dir / scene_id / "world2lidar_transforms.json"
-
-            if json_path.exists():
-                transform_jsons[scene_id] = str(json_path)
-                print(f"   ✓ 场景 {scene_id}: {json_path}")
-            else:
-                print(f"   ✗ 场景 {scene_id}: 未找到 JSON 文件 {json_path}")
-                all_valid = False
-
-        if not all_valid:
-            print("\n   ❌ 部分场景缺少 JSON 文件")
-            use_manual = input("   是否切换到手动模式? (y/n) [y]: ").strip().lower() or 'y'
-            if use_manual != 'y':
-                return None
-            json_mode = "manual"
-        else:
-            # 检查是否所有场景可以使用同一个JSON（路径相同）
-            unique_jsons = list(set(transform_jsons.values()))
-            if len(unique_jsons) == 1:
-                # 所有场景使用同一个JSON
-                transform_json = unique_jsons[0]
-                print(f"\n   ✓ 所有场景使用相同的变换文件: {transform_json}")
-            else:
-                # 多个不同的JSON，每个场景使用自己的JSON
-                print(f"\n   ✓ 每个场景使用各自的变换文件:")
-                for sid in valid_scenes:
-                    print(f"      场景 {sid}: {transform_jsons[sid]}")
-                # 保存映射关系而不是单个路径
-                transform_json = transform_jsons
-
-    if json_mode == "manual":
-        # 手动输入模式
-        print("\n   手动输入模式...")
-        print("   示例：/mnt/car_road_data_fix/transforms/world2lidar.json")
-        transform_json = input("   请输入路径: ").strip()
-
-        if not os.path.exists(transform_json):
-            print(f"❌ 文件不存在: {transform_json}")
-            return None
-
-        print(f"   ✓ 变换文件: {transform_json}")
-
-    # 3. 选择批次模式
-    print("\n📊 步骤 3/3: 选择批次模式")
+    # 2. 选择批次模式
+    print("\n📊 步骤 2/2: 选择批次模式")
     print("   选项：")
     print("     - all          : 处理所有文件（默认）")
     print("     - N            : 处理前N个（例如：10）")
@@ -575,7 +506,6 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
     # 返回配置（不包含并行配置，由各项目单独处理）
     config = {
         'scene_ids': valid_scenes,
-        'transform_json': transform_json,
         'batch_mode': batch_mode
     }
 
