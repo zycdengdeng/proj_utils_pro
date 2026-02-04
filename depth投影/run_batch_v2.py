@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3onfig
 # -*- coding: utf-8 -*-
 """
-批量depth投影处理 V2 - 路侧标定版 (lableRoadside)
+批量depth投影处理 V2 - 统一交互版
 支持多场景、统一批次选择、固定标定路径
 输出深度图：近白远黑，.npy + .jpg
 """
@@ -24,7 +24,8 @@ PROJECTOR_SCRIPT = Path(__file__).resolve().parent / "undistort_projection_multi
 
 def run_single_projection(args):
     """运行单个投影任务"""
-    pcd_path, timestamp_ms, output_dir, roadside_calib, roadside_images, camera_id = args
+    pcd_path, timestamp_ms, output_dir, roadside_calib, vehicle_calib, \
+    gt_images_folder, annotation_folder, vehicle_id, threads_per_frame = args
 
     try:
         # 动态导入核心模块
@@ -35,12 +36,12 @@ def run_single_projection(args):
 
         # 创建投影器
         projector = projector_module.DepthProjectorMultiThread(
-            roadside_calib, roadside_images, camera_id
+            roadside_calib, vehicle_calib, gt_images_folder, annotation_folder, vehicle_id
         )
 
         # 处理单帧
         success = projector.process_single_frame(
-            pcd_path, output_dir, timestamp_ms
+            pcd_path, output_dir, timestamp_ms, threads_per_frame
         )
 
         return success, "成功" if success else "处理失败", timestamp_ms
@@ -50,15 +51,7 @@ def run_single_projection(args):
         return False, error_msg[:100], timestamp_ms
 
 
-def get_roadside_camera_id_input():
-    """获取路侧相机ID输入"""
-    print("\n请输入路侧相机ID (如 3, 6, 9, 0):")
-    print("  提示: 常见映射 - cam3→pinhole0, cam6→pinhole1, cam9→pinhole2, cam0→pinhole3")
-    camera_id = input("相机ID: ").strip()
-    return camera_id
-
-
-def process_single_scene(scene_id, config, num_processes, camera_id, project_root):
+def process_single_scene(scene_id, config, num_processes, threads_per_frame, project_root):
     """处理单个场景"""
     print(f"\n{'='*80}")
     print(f"开始处理场景: {scene_id}")
@@ -67,7 +60,6 @@ def process_single_scene(scene_id, config, num_processes, camera_id, project_roo
     # 为当前场景创建独立的输出目录
     output_root = Path(project_root) / scene_id
     print(f"📂 输出目录: {output_root}")
-    print(f"📷 相机ID: {camera_id}")
 
     # 获取场景路径
     scene_paths = common_utils.get_scene_paths(scene_id)
@@ -127,12 +119,15 @@ def process_single_scene(scene_id, config, num_processes, camera_id, project_roo
             int(timestamp_ms),
             str(output_frame_dir),
             scene_paths['roadside_calib'],
-            scene_paths['roadside_images'],
-            camera_id
+            scene_paths['vehicle_calib'],
+            scene_paths.get('vehicle_images', scene_paths['roadside_images']),  # 优先使用车端GT图像
+            scene_paths['roadside_labels'],
+            config['vehicle_id'],
+            threads_per_frame
         ))
 
     # 多进程处理
-    print(f"\n🚀 开始处理 ({num_processes}进程)...")
+    print(f"\n🚀 开始处理 ({num_processes}进程 × {threads_per_frame}线程)...")
     success_count = 0
     failed_list = []
     start_time = time.time()
@@ -188,7 +183,7 @@ def process_single_scene(scene_id, config, num_processes, camera_id, project_roo
 
 def main():
     print("\n" + "="*80)
-    print("🎯 Depth投影 - 批量处理工具 V2 (路侧标定版 lableRoadside)")
+    print("🎯 Depth投影 - 批量处理工具 V2 (深度图：近白远黑)")
     print("="*80)
 
     if not PROJECTOR_SCRIPT.exists():
@@ -202,12 +197,10 @@ def main():
         print("❌ 配置输入失败")
         sys.exit(1)
 
-    # 获取路侧相机ID
-    camera_id = get_roadside_camera_id_input()
-
-    # 并行配置（只需要进程数）
+    # 并行配置（支持批量模式）
     parallel_config = common_utils.get_parallel_config(batch_mode_enabled=batch_mode)
     num_processes = parallel_config['num_processes']
+    threads_per_frame = parallel_config['threads_per_frame']
 
     # 输出根目录（固定为当前项目目录）
     output_root = Path(__file__).resolve().parent
@@ -218,17 +211,22 @@ def main():
     print(f"   场景数量: {len(config['scene_ids'])}")
     print(f"   场景列表: {', '.join(config['scene_ids'])}")
     print(f"   批次模式: {config['batch_mode']}")
-    print(f"   相机ID: {camera_id}")
-    print(f"   并行配置: {num_processes}进程")
+    print(f"   车辆ID: {config['vehicle_id']}")
+    print(f"   并行配置: {num_processes}进程 × {threads_per_frame}线程")
     print(f"   输出目录: {output_root}/{{场景ID}}/")
     print(f"{'='*80}")
+
+    # confirm = input("\n开始处理? (y/n): ").strip().lower()
+    # if confirm != 'y':
+    #     print("❌ 取消处理")
+    #     sys.exit(0)
 
     # 处理每个场景
     overall_start = time.time()
 
     for scene_id in config['scene_ids']:
         process_single_scene(
-            scene_id, config, num_processes, camera_id, output_root
+            scene_id, config, num_processes, threads_per_frame, output_root
         )
 
     overall_elapsed = time.time() - overall_start

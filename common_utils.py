@@ -9,8 +9,10 @@ import os
 import json
 import glob
 import numpy as np
+import cv2
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from scipy.spatial.transform import Rotation as ScipyR
 import tempfile
 
 
@@ -94,7 +96,7 @@ def validate_scene_paths(paths: Dict[str, str]) -> bool:
     Returns:
         是否所有必需路径都存在
     """
-    required = ['pcd', 'vehicle_calib', 'roadside_calib']
+    required = ['pcd', 'vehicle_calib', 'roadside_calib', 'roadside_labels']
     missing = []
 
     for key in required:
@@ -211,6 +213,156 @@ def transform_points_to_lidar(points_world: np.ndarray, transform: Dict) -> np.n
     points_lidar = (R @ points_world.T).T + translation
 
     return points_lidar
+
+
+# ==================== 路侧标注版 (lableRoadside) 变换 ====================
+
+# LiDAR安装偏移参数
+LIDAR_ADJUST = {
+    'x_offset': 0.0,
+    'y_offset': -2.0,
+    'z_offset': 1.0,
+}
+
+# IMU和LiDAR固定偏移
+IMU_IN_CAR_X = 1.385
+IMU_IN_CAR_Y = 0.0
+LIDAR_TO_IMU_X = 0.003551
+LIDAR_TO_IMU_Y = 1.630648
+LIDAR_TO_IMU_Z = 1.262754
+
+
+def getWorld2Carlidar(rotate_car2world, trans_car2world, lidar2car_quat, lidar2car_trans):
+    """
+    根据车辆pose计算从世界坐标系到车载LiDAR坐标系的变换
+
+    Args:
+        rotate_car2world: 车辆在世界坐标系的旋转 (roll, pitch, yaw) 罗德里格斯向量 (3,1)
+        trans_car2world: 车辆在世界坐标系的平移 (x, y, z) (3,1)
+        lidar2car_quat: LiDAR到车体的四元数 [x, y, z, w]
+        lidar2car_trans: LiDAR到车体的平移 [x, y, z]
+
+    Returns:
+        rotation_vector: world2lidar 旋转向量（罗德里格斯）(3,1)
+        translation: world2lidar 平移向量 (3,1)
+    """
+    R_car2world = cv2.Rodrigues(rotate_car2world)[0]
+    R_world2car = R_car2world.T
+    t_world2car = -R_world2car @ trans_car2world
+
+    r_lidar2car = ScipyR.from_quat(lidar2car_quat)
+    R_lidar2car = r_lidar2car.as_matrix()
+
+    R_car2lidar = R_lidar2car.T
+    lidar2car_trans_array = np.asarray(lidar2car_trans).reshape((3, 1))
+    t_car2lidar = -R_car2lidar @ lidar2car_trans_array
+
+    R_world2lidar = R_car2lidar @ R_world2car
+    t_world2lidar = R_car2lidar @ t_world2car + t_car2lidar
+
+    rotation_vector, _ = cv2.Rodrigues(R_world2lidar)
+
+    return rotation_vector, t_world2lidar
+
+
+def get_vehicle_pose_from_annotation(annotation_path: str, vehicle_id: int) -> Optional[Dict]:
+    """
+    从标注文件中获取指定动态物体的pose
+
+    Args:
+        annotation_path: 标注JSON文件路径
+        vehicle_id: 动态物体ID
+
+    Returns:
+        包含 x, y, z, roll, pitch, yaw, height 等信息的字典，未找到返回None
+    """
+    with open(annotation_path, 'r') as f:
+        annotation = json.load(f)
+
+    for obj in annotation.get('object', []):
+        if obj['id'] == vehicle_id:
+            return obj
+
+    return None
+
+
+def compute_world2lidar_from_annotation(annotation_path: str, vehicle_id: int):
+    """
+    从标注文件中根据动态物体ID计算 world2lidar 变换
+
+    Args:
+        annotation_path: 标注JSON文件路径
+        vehicle_id: 动态物体ID
+
+    Returns:
+        rotation_vector: world2lidar 旋转向量 (3,1)
+        translation: world2lidar 平移向量 (3,1)
+
+    Raises:
+        ValueError: 当未找到指定ID的物体时
+    """
+    vehicle = get_vehicle_pose_from_annotation(annotation_path, vehicle_id)
+    if vehicle is None:
+        raise ValueError(f"标注文件中未找到动态物体ID {vehicle_id}: {annotation_path}")
+
+    # 从标注获取车辆pose
+    car2world_rotate = np.array([
+        vehicle['roll'], vehicle['pitch'], vehicle['yaw']
+    ]).reshape((3, 1))
+    car2world_trans = np.array([
+        vehicle['x'], vehicle['y'], vehicle['z']
+    ]).reshape((3, 1))
+
+    # 计算LiDAR偏移
+    box_height = vehicle.get('height', 1.72)
+    imu_in_car_z = box_height / 2 - 1.12
+
+    lidar_quat = [0, 0, 0, 1]  # 默认无旋转
+    lidar_trans = [
+        IMU_IN_CAR_X + LIDAR_TO_IMU_X + LIDAR_ADJUST['x_offset'],
+        IMU_IN_CAR_Y + LIDAR_TO_IMU_Y + LIDAR_ADJUST['y_offset'],
+        imu_in_car_z + LIDAR_TO_IMU_Z + LIDAR_ADJUST['z_offset']
+    ]
+
+    return getWorld2Carlidar(car2world_rotate, car2world_trans, lidar_quat, lidar_trans)
+
+
+def get_vehicle_id_input(batch_mode_enabled: bool = False) -> Optional[int]:
+    """
+    交互式输入路侧标注的动态物体ID
+
+    Args:
+        batch_mode_enabled: 是否启用批量模式
+
+    Returns:
+        动态物体ID (int)，失败返回None
+    """
+    if batch_mode_enabled:
+        config = load_batch_config()
+        if config and 'vehicle_id' in config:
+            print(f"✓ 使用已保存的动态物体ID: {config['vehicle_id']}")
+            return config['vehicle_id']
+
+    print("\n🚗 路侧标注动态物体ID配置:")
+    print("   请输入要投影的目标车辆在标注文件中的ID（整数）")
+    print("   示例：45")
+
+    vehicle_id_str = input("   请输入动态物体ID: ").strip()
+
+    try:
+        vehicle_id = int(vehicle_id_str)
+    except ValueError:
+        print(f"❌ 无效的ID: {vehicle_id_str}（必须为整数）")
+        return None
+
+    print(f"   ✓ 动态物体ID: {vehicle_id}")
+
+    # 保存到批量配置
+    config = load_batch_config() or {}
+    config['vehicle_id'] = vehicle_id
+    save_batch_config(config)
+
+    return vehicle_id
 
 
 # ==================== 批次选择逻辑 ====================
@@ -454,6 +606,8 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
         if config:
             print("\n✓ 使用已保存的配置:")
             print(f"   场景: {', '.join(config['scene_ids'])}")
+            if 'vehicle_id' in config:
+                print(f"   动态物体ID: {config['vehicle_id']}")
             print(f"   批次: {config['batch_mode']}")
             print(f"{'='*60}\n")
             return config
@@ -461,11 +615,11 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
             print("\n⚠️  未找到批量配置文件，切换到交互式输入\n")
 
     print("\n" + "="*60)
-    print("🚀 投影处理系统 - 统一交互界面 (路侧标定版 lableRoadside)")
+    print("🚀 投影处理系统 - 统一交互界面 (路侧标注版 lableRoadside)")
     print("="*60)
 
     # 1. 输入场景ID（支持多个）
-    print("\n📁 步骤 1/2: 输入场景ID")
+    print("\n📁 步骤 1/3: 输入场景ID")
     print("   提示：可以输入多个场景ID，用空格分隔")
     print("   示例：002 004 005")
     scene_input = input("   请输入场景ID: ").strip()
@@ -491,8 +645,22 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
         print("❌ 没有有效的场景")
         return None
 
-    # 2. 选择批次模式
-    print("\n📊 步骤 2/2: 选择批次模式")
+    # 2. 输入路侧标注的动态物体ID
+    print("\n🚗 步骤 2/3: 输入路侧标注的动态物体ID")
+    print("   说明：输入要投影的目标车辆在标注文件中的ID（整数）")
+    print("   系统将根据标注中该车辆的pose计算坐标变换")
+    vehicle_id_str = input("   请输入动态物体ID: ").strip()
+
+    try:
+        vehicle_id = int(vehicle_id_str)
+    except ValueError:
+        print(f"❌ 无效的ID: {vehicle_id_str}（必须为整数）")
+        return None
+
+    print(f"   ✓ 动态物体ID: {vehicle_id}")
+
+    # 3. 选择批次模式
+    print("\n📊 步骤 3/3: 选择批次模式")
     print("   选项：")
     print("     - all          : 处理所有文件（默认）")
     print("     - N            : 处理前N个（例如：10）")
@@ -506,6 +674,7 @@ def interactive_input(batch_mode_enabled: bool = False) -> Dict:
     # 返回配置（不包含并行配置，由各项目单独处理）
     config = {
         'scene_ids': valid_scenes,
+        'vehicle_id': vehicle_id,
         'batch_mode': batch_mode
     }
 
@@ -709,115 +878,6 @@ def load_carid_mapping(carid_json_path: Optional[str] = None) -> Dict[str, int]:
     except Exception as e:
         print(f"❌ 加载carid.json失败: {e}")
         return {}
-
-
-# ==================== 路侧标定Camera ID管理 ====================
-def load_roadside_calib(calib_path: Optional[str] = None) -> Dict:
-    """
-    加载路侧标定文件
-
-    Args:
-        calib_path: calib.json路径，默认使用 ROADSIDE_CALIB_FILE
-
-    Returns:
-        标定数据字典
-    """
-    if calib_path is None:
-        calib_path = ROADSIDE_CALIB_FILE
-
-    if not os.path.exists(calib_path):
-        raise FileNotFoundError(f"路侧标定文件不存在: {calib_path}")
-
-    with open(calib_path, 'r') as f:
-        calib_data = json.load(f)
-
-    return calib_data
-
-
-def get_available_roadside_camera_ids(calib_path: Optional[str] = None) -> List[str]:
-    """
-    获取路侧标定文件中所有可用的camera ID
-
-    Args:
-        calib_path: calib.json路径
-
-    Returns:
-        可用的camera ID列表
-    """
-    calib_data = load_roadside_calib(calib_path)
-    camera_ids = list(calib_data.get("camera", {}).keys())
-    return camera_ids
-
-
-def validate_roadside_camera_id(camera_id: str, calib_path: Optional[str] = None) -> bool:
-    """
-    验证camera ID是否存在于路侧标定文件中
-
-    Args:
-        camera_id: 要验证的camera ID
-        calib_path: calib.json路径
-
-    Returns:
-        是否有效
-    """
-    available_ids = get_available_roadside_camera_ids(calib_path)
-    return str(camera_id) in available_ids
-
-
-def get_roadside_camera_id_input(calib_path: Optional[str] = None,
-                                  batch_mode_enabled: bool = False) -> str:
-    """
-    交互式获取路侧标定camera ID
-
-    Args:
-        calib_path: calib.json路径
-        batch_mode_enabled: 是否批量模式
-
-    Returns:
-        用户选择的camera ID
-    """
-    # 批量模式：从配置文件读取
-    if batch_mode_enabled:
-        config = load_batch_config()
-        if config and 'roadside_camera_id' in config:
-            camera_id = config['roadside_camera_id']
-            print(f"\n📷 路侧标定Camera ID:")
-            print(f"   使用已保存的配置: {camera_id}")
-            return camera_id
-
-    # 获取可用ID列表
-    try:
-        available_ids = get_available_roadside_camera_ids(calib_path)
-    except FileNotFoundError as e:
-        print(f"❌ {e}")
-        return None
-
-    if not available_ids:
-        print(f"❌ 标定文件中没有找到任何camera ID")
-        return None
-
-    print(f"\n📷 路侧标定Camera ID配置:")
-    print(f"   标定文件中可用的ID: {', '.join(available_ids)}")
-    camera_id = input(f"   请输入要使用的Camera ID: ").strip()
-
-    if not camera_id:
-        print(f"❌ 未输入Camera ID")
-        return None
-
-    if str(camera_id) not in available_ids:
-        print(f"❌ Camera ID '{camera_id}' 不存在于标定文件中")
-        print(f"   可用的ID: {', '.join(available_ids)}")
-        return None
-
-    print(f"   ✓ 使用Camera ID: {camera_id}")
-
-    # 保存到配置文件
-    config = load_batch_config()
-    if config:
-        config['roadside_camera_id'] = camera_id
-        save_batch_config(config)
-
-    return camera_id
 
 
 # ==================== 工具函数 ====================
